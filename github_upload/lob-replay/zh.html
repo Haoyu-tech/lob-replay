@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="用 Databento 逐笔订单数据在 JAX 中重建一小时 CME 比特币期货订单簿：深度热力图、成交与 FIFO 排队，145,399 个交易所事件全部一致。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="BTC 期货订单簿：L3 逐笔回放">
+<meta property="og:description" content="用 Databento 逐笔订单数据在 JAX 中重建一小时 CME 比特币期货订单簿：深度热力图、成交与 FIFO 排队，145,399 个交易所事件全部一致。">
+<meta property="og:image" content="https://haoyu-tech.github.io/haoyuwang.github.io/lob-replay/preview.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="https://haoyu-tech.github.io/haoyuwang.github.io/lob-replay/zh.html">
+<meta name="twitter:card" content="summary_large_image">
+<title>BTC 期货 L3 回放</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: exchange-terminal reading order — verdict strip, then the tape (depth heatmap over time), then the queue ladder at the cursor. */
+:root {
+  --bg: #f6f7f8;
+  --panel: #ffffff;
+  --ink: #15181c;
+  --ink-2: #4c535c;
+  --ink-3: #7d858f;
+  --rule: #e2e5e9;
+  --grid: #eceef1;
+  --cursor: #15181c;
+  --good: #0a8a0a;
+  --bid-1: #cde2fb; --bid-2: #9ec5f4; --bid-3: #6da7ec; --bid-4: #3987e5; --bid-5: #256abf; --bid-6: #184f95;
+  --ask-1: #fbd9c9; --ask-2: #f6b393; --ask-3: #f08c5f; --ask-4: #eb6834; --ask-5: #c24e1f; --ask-6: #8f3711;
+  --bid-line: #104281; --ask-line: #7a2e0e;
+  --font-ui: "IBM Plex Sans", "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111316; --panel: #181b1f; --ink: #eef0f2; --ink-2: #b4bac2; --ink-3: #848b94;
+    --rule: #2a2f35; --grid: #22262b; --cursor: #eef0f2; --good: #3fbf3f;
+    --bid-1: #16314f; --bid-2: #1c4b85; --bid-3: #256abf; --bid-4: #3987e5; --bid-5: #6da7ec; --bid-6: #b7d3f6;
+    --ask-1: #4a2312; --ask-2: #7a3315; --ask-3: #b5491d; --ask-4: #eb6834; --ask-5: #f08c5f; --ask-6: #f9c8b0;
+    --bid-line: #cde2fb; --ask-line: #fde2d5;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #111316; --panel: #181b1f; --ink: #eef0f2; --ink-2: #b4bac2; --ink-3: #848b94;
+  --rule: #2a2f35; --grid: #22262b; --cursor: #eef0f2; --good: #3fbf3f;
+  --bid-1: #16314f; --bid-2: #1c4b85; --bid-3: #256abf; --bid-4: #3987e5; --bid-5: #6da7ec; --bid-6: #b7d3f6;
+  --ask-1: #4a2312; --ask-2: #7a3315; --ask-3: #b5491d; --ask-4: #eb6834; --ask-5: #f08c5f; --ask-6: #f9c8b0;
+  --bid-line: #cde2fb; --ask-line: #fde2d5;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-ui); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: 20px; padding-block: 24px 48px; display: grid; gap: 20px; }
+header { display: grid; gap: 6px; }
+.eyebrow { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); letter-spacing: .04em; }
+h1 { margin: 0; font-size: 26px; font-weight: 600; text-wrap: balance; letter-spacing: -.01em; }
+.lede { margin: 0; color: var(--ink-2); max-width: 70ch; }
+.verdict { display: flex; flex-wrap: wrap; gap: 10px 28px; padding-block: 14px; border-block: 1px solid var(--rule); }
+.kv { display: grid; gap: 2px; min-width: 0; }
+.kv .k { font-size: 12px; color: var(--ink-3); }
+.kv .v { font-family: var(--font-data); font-size: 18px; font-variant-numeric: tabular-nums; }
+.pass { display: inline-flex; align-items: center; gap: 6px; color: var(--good); font-weight: 600; }
+.pass svg { flex: none; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+.panel-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.panel-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.note { font-size: 12px; color: var(--ink-3); margin: 0; }
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+button, select { font: inherit; font-size: 13px; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 4px; padding: 4px 10px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--ink-3); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--bid-4); outline-offset: 2px; }
+button[aria-pressed="true"] { background: var(--ink); color: var(--panel); border-color: var(--ink); }
+.seg { display: inline-flex; gap: 0; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 4px 0 0 4px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 4px 4px 0; }
+.clock { font-family: var(--font-data); font-size: 15px; font-variant-numeric: tabular-nums; min-width: 9ch; }
+input[type=range] { flex: 1 1 260px; min-width: 0; accent-color: var(--ink); }
+.chart { position: relative; width: 100%; }
+.chart canvas { display: block; width: 100%; }
+#heat { height: 420px; cursor: crosshair; }
+#strip { height: 64px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 12px; color: var(--ink-2); align-items: center; }
+.sw { display: inline-flex; gap: 2px; vertical-align: middle; margin-right: 4px; }
+.sw i { width: 12px; height: 10px; border-radius: 2px; display: inline-block; }
+.tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--rule); border-radius: 4px; padding: 6px 8px; font-size: 12px; font-family: var(--font-data); font-variant-numeric: tabular-nums; color: var(--ink); box-shadow: 0 4px 14px rgb(0 0 0 / .12); white-space: nowrap; z-index: 3; }
+.tip b { font-family: var(--font-ui); font-weight: 600; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
+@media (max-width: 900px) { .grid2 { grid-template-columns: minmax(0, 1fr); } #heat { height: 340px; } }
+.ladder { font-family: var(--font-data); font-size: 12px; font-variant-numeric: tabular-nums; display: grid; gap: 2px; overflow-x: auto; }
+.row { display: grid; grid-template-columns: 78px 28px minmax(0, 1fr); align-items: center; gap: 8px; height: 22px; }
+.row .p { text-align: right; }
+.row.ask .p { color: var(--ask-line); }
+.row.bid .p { color: var(--bid-line); }
+.row .q { text-align: right; color: var(--ink-2); }
+.blocks { display: flex; gap: 2px; height: 16px; min-width: 0; }
+.blocks i { height: 16px; border-radius: 2px; flex: none; }
+.spread { display: grid; grid-template-columns: 78px 1fr; gap: 8px; height: 24px; align-items: center; color: var(--ink-3); font-size: 12px; }
+.spread span:first-child { text-align: right; }
+.spread::after { content: ""; }
+.qhead { display: grid; grid-template-columns: 78px 28px minmax(0, 1fr); gap: 8px; font-size: 11px; color: var(--ink-3); font-family: var(--font-ui); }
+.qhead span:nth-child(1), .qhead span:nth-child(2) { text-align: right; }
+.facts { display: grid; gap: 8px; font-size: 13px; color: var(--ink-2); }
+.facts dt { font-size: 12px; color: var(--ink-3); }
+.facts dd { margin: 0; font-family: var(--font-data); color: var(--ink); font-variant-numeric: tabular-nums; }
+.facts div { display: grid; gap: 1px; }
+table.tbl { border-collapse: collapse; font-size: 12px; font-family: var(--font-data); font-variant-numeric: tabular-nums; width: 100%; }
+.tbl th, .tbl td { padding: 4px 8px; border-bottom: 1px solid var(--rule); text-align: right; }
+.tbl th:first-child, .tbl td:first-child { text-align: left; }
+.tbl th { font-family: var(--font-ui); font-weight: 500; color: var(--ink-3); }
+details summary { cursor: pointer; color: var(--ink-2); font-size: 13px; }
+.loading { color: var(--ink-3); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow"><a href="./" style="color:inherit">English</a> · <a href="../" style="color:inherit">Haoyu Wang</a> · CME GLBX.MDP3 · BTC.c.0 · MBO · 2026-09-15 00:00–01:00 UTC</div>
+    <h1>BTC 期货订单簿：L3 逐笔回放</h1>
+    <p class="lede">用 Databento 逐笔订单数据在 JAX 引擎里重建订单簿，每秒取一帧。热力图是各价位的挂单量，下方是选中时刻每个价位上逐笔订单的排队顺序。</p>
+  </header>
+
+  <section class="verdict" aria-label="校验结果">
+    <div class="kv"><span class="k">与交易所订单簿比对</span><span class="v pass"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="7" fill="currentColor"/><path d="M4.5 8.2l2.3 2.3 4.7-4.9" stroke="var(--panel)" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>145,399 / 145,399 事件一致</span></div>
+    <div class="kv"><span class="k">原始记录</span><span class="v" id="k-rec">146,371</span></div>
+    <div class="kv"><span class="k">引擎消息</span><span class="v" id="k-msg">185,677</span></div>
+    <div class="kv"><span class="k">开盘快照挂单</span><span class="v" id="k-snap">253</span></div>
+    <div class="kv"><span class="k">成交笔数</span><span class="v" id="k-tr">340</span></div>
+    <div class="kv"><span class="k">JAX 回放（CPU，含编译）</span><span class="v">2.5 s</span></div>
+  </section>
+
+  <div class="grid2">
+    <section class="panel" aria-label="订单簿深度热力图">
+      <div class="panel-head">
+        <h2>深度热力图</h2>
+        <div class="controls">
+          <div class="seg" role="group" aria-label="时间窗口">
+            <button id="w3600" aria-pressed="true">1 小时</button>
+            <button id="w600" aria-pressed="false">10 分钟</button>
+            <button id="w120" aria-pressed="false">2 分钟</button>
+          </div>
+        </div>
+      </div>
+      <div class="legend">
+        <span><span class="sw" id="sw-bid"></span>买单挂单量</span>
+        <span><span class="sw" id="sw-ask"></span>卖单挂单量</span>
+        <span>色块从左到右：1 / 2 / 3 / 4–5 / 6–9 / 10+ 张</span>
+        <span><svg width="12" height="10" aria-hidden="true"><path d="M6 1L11 9H1z" fill="var(--ask-4)" stroke="var(--panel)" stroke-width="1.5"/></svg> 主动买入成交</span>
+        <span><svg width="12" height="10" aria-hidden="true"><path d="M6 9L11 1H1z" fill="var(--bid-4)" stroke="var(--panel)" stroke-width="1.5"/></svg> 主动卖出成交</span>
+      </div>
+      <div class="chart" id="heat-wrap">
+        <canvas id="heat" role="img" aria-label="一小时内各价位挂单量随时间变化的热力图，叠加最优买卖价和成交点"></canvas>
+        <div class="tip" id="tip" hidden></div>
+      </div>
+      <div class="chart"><canvas id="strip" role="img" aria-label="每秒引擎消息数"></canvas></div>
+      <p class="note">下条：每秒引擎消息数（新增、撤单、改单、成交）。点击热力图选择时刻。</p>
+      <div class="controls">
+        <button id="play" aria-label="播放">▶ 播放</button>
+        <select id="speed" aria-label="播放速度">
+          <option value="1">1×</option><option value="5">5×</option><option value="20" selected>20×</option><option value="60">60×</option>
+        </select>
+        <button id="back" aria-label="后退一秒">−1s</button>
+        <button id="fwd" aria-label="前进一秒">+1s</button>
+        <span class="clock" id="clock">00:00:00</span>
+        <input type="range" id="slider" min="0" max="3599" value="1500" aria-label="时间">
+      </div>
+    </section>
+
+    <section class="panel" aria-label="逐笔排队">
+      <div class="panel-head">
+        <h2>逐笔排队 <span class="clock" id="clock2" style="font-size:13px;color:var(--ink-3)"></span></h2>
+      </div>
+      <p class="note">每个方块是一笔挂单，宽度对应张数，最左边排在队首。颜色表示挂单时长，见下方图例。</p>
+      <div class="qhead"><span>价格 $</span><span>张</span><span>队首 → 队尾</span></div>
+      <div class="ladder" id="ladder"><span class="loading">载入数据…</span></div>
+      <div class="legend" id="agelegend"></div>
+      <dl class="facts" id="facts"></dl>
+    </section>
+  </div>
+
+  <section class="panel">
+    <details>
+      <summary>表格视图：选中时刻前 10 档</summary>
+      <div style="overflow-x:auto"><table class="tbl" id="tbl"></table></div>
+    </details>
+    <p class="note">数据：Databento GLBX.MDP3 MBO，CME 比特币期货主力合约（合约编号 42016465），1 tick = $5。引擎：基于 JAX-LOB 订单簿数组，历史成交按订单 ID 精确回放。每帧为该秒结束时的订单簿状态。</p>
+  </section>
+</div>
+
+<script src="viz_data.js"></script>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const fmtT = (s, t0) => { const d = new Date((t0 + s) * 1000); return d.toISOString().slice(11, 19); };
+  const fmtP = (tick, tk) => (tick * tk).toLocaleString('en-US');
+  let D = null, sel = 1500, win = 3600, playing = false, timer = null;
+  let heatImg = null, colors = null, rows = null;
+
+  function readColors() {
+    const cs = getComputedStyle(document.documentElement);
+    const g = (n) => cs.getPropertyValue(n).trim();
+    const hex = (h) => { h = h.replace('#', ''); return [parseInt(h.slice(0,2),16), parseInt(h.slice(2,4),16), parseInt(h.slice(4,6),16)]; };
+    colors = {
+      bid: [1,2,3,4,5,6].map(i => g('--bid-' + i)), ask: [1,2,3,4,5,6].map(i => g('--ask-' + i)),
+      bidRGB: [1,2,3,4,5,6].map(i => hex(g('--bid-' + i))), askRGB: [1,2,3,4,5,6].map(i => hex(g('--ask-' + i))),
+      bidLine: g('--bid-line'), askLine: g('--ask-line'), ink: g('--ink'), ink2: g('--ink-2'), ink3: g('--ink-3'),
+      grid: g('--grid'), panel: g('--panel'), cursor: g('--cursor'), rule: g('--rule'),
+    };
+    $('sw-bid').innerHTML = colors.bid.map(c => `<i style="background:${c}"></i>`).join('');
+    $('sw-ask').innerHTML = colors.ask.map(c => `<i style="background:${c}"></i>`).join('');
+  }
+  const bucket = (q) => q <= 1 ? 0 : q === 2 ? 1 : q === 3 ? 2 : q <= 5 ? 3 : q <= 9 ? 4 : 5;
+
+  function buildImage() {
+    // 1 像素 = 1 秒 × 1 tick
+    const W = D.nsec, H = rows.hi - rows.lo + 1;
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const ctx = c.getContext('2d'); const im = ctx.createImageData(W, H);
+    D.frames.forEach((f, x) => {
+      for (const [side, arr] of [['b', f.b], ['a', f.a]]) {
+        const pal = side === 'b' ? colors.bidRGB : colors.askRGB;
+        for (const [tk, q] of arr) {
+          if (tk < rows.lo || tk > rows.hi) continue;
+          const y = rows.hi - tk, o = (y * W + x) * 4, rgb = pal[bucket(q)];
+          im.data[o] = rgb[0]; im.data[o+1] = rgb[1]; im.data[o+2] = rgb[2]; im.data[o+3] = 255;
+        }
+      }
+    });
+    ctx.putImageData(im, 0, 0); heatImg = c;
+  }
+
+  function sizeCanvas(cv) {
+    const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+    const ctx = cv.getContext('2d'); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return [ctx, r.width, r.height];
+  }
+
+  function windowRange() {
+    if (win >= D.nsec) return [0, D.nsec];
+    let a = Math.round(sel - win / 2); a = Math.max(0, Math.min(D.nsec - win, a));
+    return [a, a + win];
+  }
+
+  const M = { l: 64, r: 10, t: 8, b: 22 };
+  let view = null;
+
+  function drawHeat() {
+    const cv = $('heat'); const [ctx, w, h] = sizeCanvas(cv);
+    const [s0, s1] = windowRange();
+    let lo = Infinity, hi = -Infinity;
+    for (let s = s0; s < s1; s++) { const f = D.frames[s]; if (f.b.length) lo = Math.min(lo, f.b[0][0]); if (f.a.length) hi = Math.max(hi, f.a[0][0]); }
+    const pad = win >= 3600 ? 14 : win >= 600 ? 10 : 8;
+    lo = Math.max(rows.lo, lo - pad); hi = Math.min(rows.hi, hi + pad);
+    const pw = w - M.l - M.r, ph = h - M.t - M.b;
+    const xs = (s) => M.l + (s - s0) / (s1 - s0) * pw;
+    const ys = (tk) => M.t + (hi - tk) / (hi - lo + 1) * ph;     // 价位上沿
+    const rowH = ph / (hi - lo + 1);
+    view = { s0, s1, lo, hi, xs, ys, rowH, pw, ph };
+    ctx.clearRect(0, 0, w, h);
+    // 价格网格
+    ctx.font = '11px ' + getComputedStyle(document.body).getPropertyValue('--font-data');
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    const step = (hi - lo) > 80 ? 10 : (hi - lo) > 35 ? 5 : 2;
+    for (let tk = Math.ceil(lo / step) * step; tk <= hi; tk += step) {
+      const y = ys(tk) + rowH / 2;
+      ctx.strokeStyle = colors.grid; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(M.l, y); ctx.lineTo(M.l + pw, y); ctx.stroke();
+      ctx.fillStyle = colors.ink3; ctx.fillText(fmtP(tk, D.tick), M.l - 6, y);
+    }
+    // 热力图
+    ctx.imageSmoothingEnabled = (s1 - s0) > pw;
+    ctx.drawImage(heatImg, s0, rows.hi - hi, s1 - s0, hi - lo + 1, M.l, M.t, pw, ph);
+    // 最优买卖价
+    for (const [side, col] of [['b', colors.bidLine], ['a', colors.askLine]]) {
+      ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath(); let first = true;
+      for (let s = s0; s < s1; s++) {
+        const f = D.frames[s][side]; if (!f.length) { first = true; continue; }
+        const y = side === 'b' ? ys(f[0][0]) : ys(f[0][0]) + rowH;   // 买价画在格子上沿，卖价画在格子下沿
+        const x0 = xs(s), x1 = xs(s + 1);
+        if (first) { ctx.moveTo(x0, y); first = false; } else ctx.lineTo(x0, y);
+        ctx.lineTo(x1, y);
+      }
+      ctx.stroke();
+    }
+    // 成交点
+    for (const [s, tk, q, aggr] of D.trades) {
+      if (s < s0 || s >= s1 || tk < lo || tk > hi) continue;
+      const x = xs(s + 0.5), y = ys(tk) + rowH / 2, r = Math.min(7, 3.5 + q * 1.2);
+      ctx.beginPath();
+      if (aggr === 1) { ctx.moveTo(x, y - r); ctx.lineTo(x + r, y + r * .8); ctx.lineTo(x - r, y + r * .8); }
+      else { ctx.moveTo(x, y + r); ctx.lineTo(x + r, y - r * .8); ctx.lineTo(x - r, y - r * .8); }
+      ctx.closePath(); ctx.fillStyle = aggr === 1 ? colors.ask[3] : colors.bid[3];
+      ctx.lineWidth = 2; ctx.strokeStyle = colors.panel; ctx.stroke(); ctx.fill();
+    }
+    // 时间轴
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top'; ctx.fillStyle = colors.ink3;
+    const span = s1 - s0; const tstep = [10, 20, 30, 60, 120, 300, 600, 1200].find(st => pw / (span / st) >= 78) || 1200;
+    for (let s = Math.ceil(s0 / tstep) * tstep; s <= s1; s += tstep) {
+      const x = xs(s); ctx.fillText(fmtT(s, D.t0), Math.min(Math.max(x, M.l + 26), M.l + pw - 26), M.t + ph + 6);
+    }
+    // 光标
+    if (sel >= s0 && sel < s1) {
+      const x = xs(sel + 0.5); ctx.strokeStyle = colors.cursor; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(x, M.t); ctx.lineTo(x, M.t + ph); ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+
+  function drawStrip() {
+    const cv = $('strip'); const [ctx, w, h] = sizeCanvas(cv);
+    const [s0, s1] = windowRange(); const pw = w - M.l - M.r, ph = h - 14;
+    let mx = 1; for (let s = s0; s < s1; s++) { const a = D.act[s]; mx = Math.max(mx, a[0] + a[1] + a[2] + a[3]); }
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = colors.ink3; ctx.font = '11px ' + getComputedStyle(document.body).getPropertyValue('--font-data');
+    ctx.textAlign = 'right'; ctx.textBaseline = 'top'; ctx.fillText(mx + '/s', M.l - 6, 0);
+    ctx.textBaseline = 'bottom'; ctx.fillText('0', M.l - 6, ph);
+    ctx.strokeStyle = colors.grid; ctx.beginPath(); ctx.moveTo(M.l, ph + .5); ctx.lineTo(M.l + pw, ph + .5); ctx.stroke();
+    const bw = pw / (s1 - s0);
+    ctx.fillStyle = colors.ink2;
+    for (let s = s0; s < s1; s++) {
+      const a = D.act[s], v = a[0] + a[1] + a[2] + a[3]; if (!v) continue;
+      const bh = v / mx * (ph - 4), x = M.l + (s - s0) * bw;
+      ctx.fillRect(x, ph - bh, Math.max(bw - (bw > 3 ? 1 : 0), .6), bh);
+    }
+    if (sel >= s0 && sel < s1) { const x = M.l + (sel - s0 + .5) * bw; ctx.strokeStyle = colors.cursor; ctx.setLineDash([3,3]); ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, ph); ctx.stroke(); ctx.setLineDash([]); }
+  }
+
+  const AGE = [[10, '<10 秒'], [60, '<1 分钟'], [600, '<10 分钟'], [Infinity, '≥10 分钟（含开盘快照）']];
+  const ageIdx = (a) => AGE.findIndex(([lim]) => a < lim);
+
+  function drawLadder() {
+    const f = D.frames[sel]; const tk = D.tick;
+    const unit = 13;
+    const row = (cls, lv) => {
+      const [p, orders] = lv; const pal = cls === 'ask' ? colors.ask : colors.bid;
+      const tot = orders.reduce((s, o) => s + o[0], 0);
+      const blocks = orders.map(([q, age], i) => `<i title="第 ${i + 1} 位 · ${q} 张 · 已挂 ${age >= 86400 ? (age / 86400).toFixed(1) + ' 天' : age >= 60 ? Math.round(age / 60) + ' 分钟' : age + ' 秒'}" style="width:${q * unit - 2}px;background:${pal[2 + ageIdx(age)]}"></i>`).join('');
+      return `<div class="row ${cls}"><span class="p">${fmtP(p, tk)}</span><span class="q">${tot}</span><span class="blocks">${blocks}</span></div>`;
+    };
+    const asks = (f.qa || []).slice(0, 10).reverse(), bids = (f.qb || []).slice(0, 10);
+    const ba = f.a.length ? f.a[0][0] : null, bb = f.b.length ? f.b[0][0] : null;
+    const spr = ba !== null && bb !== null ? ba - bb : null;
+    $('ladder').innerHTML = asks.map(l => row('ask', l)).join('') +
+      `<div class="spread"><span>价差</span><span>${spr === null ? '—' : spr + ' tick · $' + (spr * tk)}</span></div>` +
+      bids.map(l => row('bid', l)).join('');
+    $('clock').textContent = fmtT(sel, D.t0); $('clock2').textContent = fmtT(sel, D.t0) + ' UTC';
+    const a = D.act[sel];
+    const nOrd = (f.qa || []).reduce((s, l) => s + l[1].length, 0) + (f.qb || []).reduce((s, l) => s + l[1].length, 0);
+    const trades = D.trades.filter(t => t[0] === sel);
+    $('facts').innerHTML =
+      `<div><dt>最优买 / 卖</dt><dd>${bb === null ? '—' : fmtP(bb, tk)} / ${ba === null ? '—' : fmtP(ba, tk)}</dd></div>` +
+      `<div><dt>这一秒的消息</dt><dd>新增 ${a[0]} · 减量 ${a[1]} · 撤单 ${a[2]} · 成交 ${a[3]}</dd></div>` +
+      `<div><dt>这一秒的成交</dt><dd>${trades.length ? trades.map(t => (t[3] === 1 ? '买 ' : '卖 ') + t[2] + ' 张 @ ' + fmtP(t[1], tk)).join('<br>') : '无'}</dd></div>` +
+      `<div><dt>前 10 档挂单笔数</dt><dd>${nOrd}</dd></div>`;
+    $('slider').value = sel;
+    // 表格
+    let html = '<tr><th>档位</th><th>买价 $</th><th>买量</th><th>买单笔数</th><th>卖价 $</th><th>卖量</th><th>卖单笔数</th></tr>';
+    for (let i = 0; i < 10; i++) {
+      const b = (f.qb || [])[i], s = (f.qa || [])[i];
+      const cell = (l) => l ? `<td>${fmtP(l[0], tk)}</td><td>${l[1].reduce((x, o) => x + o[0], 0)}</td><td>${l[1].length}</td>` : '<td>—</td><td>—</td><td>—</td>';
+      html += `<tr><td>${i + 1}</td>${cell(b)}${cell(s)}</tr>`;
+    }
+    $('tbl').innerHTML = html;
+  }
+
+  function ageLegend() {
+    $('agelegend').innerHTML = AGE.map(([, label], i) => `<span><span class="sw"><i style="background:${colors.bid[2 + i]}"></i><i style="background:${colors.ask[2 + i]}"></i></span>${label}</span>`).join('');
+  }
+
+  function render() { drawHeat(); drawStrip(); drawLadder(); }
+  function setSel(s) { sel = Math.max(0, Math.min(D.nsec - 1, s)); drawHeat(); drawStrip(); drawLadder(); }
+
+  function bind() {
+    for (const w of [3600, 600, 120]) $('w' + w).addEventListener('click', () => {
+      win = w; for (const v of [3600, 600, 120]) $('w' + v).setAttribute('aria-pressed', String(v === w)); drawHeat(); drawStrip();
+    });
+    $('slider').addEventListener('input', (e) => setSel(+e.target.value));
+    $('back').addEventListener('click', () => setSel(sel - 1));
+    $('fwd').addEventListener('click', () => setSel(sel + 1));
+    $('play').addEventListener('click', () => {
+      playing = !playing; $('play').textContent = playing ? '❚❚ 暂停' : '▶ 播放'; $('play').setAttribute('aria-label', playing ? '暂停' : '播放');
+      clearInterval(timer);
+      if (playing) timer = setInterval(() => { if (sel >= D.nsec - 1) { $('play').click(); return; } setSel(sel + 1); }, 1000 / +$('speed').value);
+    });
+    $('speed').addEventListener('change', () => { if (playing) { $('play').click(); $('play').click(); } });
+    const cv = $('heat'), tip = $('tip');
+    const pick = (e) => {
+      const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+      if (!view || x < M.l || x > M.l + view.pw || y < M.t || y > M.t + view.ph) return null;
+      const s = Math.floor(view.s0 + (x - M.l) / view.pw * (view.s1 - view.s0));
+      const tk = Math.floor(view.hi + 1 - (y - M.t) / view.rowH);
+      return { s, tk, x, y };
+    };
+    cv.addEventListener('mousemove', (e) => {
+      const p = pick(e); if (!p) { tip.hidden = true; return; }
+      const f = D.frames[p.s]; const tk = D.tick;
+      const qb = f.b.find(l => l[0] === p.tk), qa = f.a.find(l => l[0] === p.tk);
+      const q = qb ? `买单 ${qb[1]} 张` : qa ? `卖单 ${qa[1]} 张` : '无挂单';
+      tip.innerHTML = `<b>${fmtT(p.s, D.t0)} UTC</b><br>$${fmtP(p.tk, tk)} · ${q}<br>最优 ${f.b.length ? fmtP(f.b[0][0], tk) : '—'} / ${f.a.length ? fmtP(f.a[0][0], tk) : '—'}`;
+      tip.hidden = false;
+      const wrapW = $('heat-wrap').clientWidth;
+      tip.style.left = Math.min(p.x + 14, wrapW - tip.offsetWidth - 4) + 'px'; tip.style.top = (p.y + 14) + 'px';
+    });
+    cv.addEventListener('mouseleave', () => { tip.hidden = true; });
+    cv.addEventListener('click', (e) => { const p = pick(e); if (p) setSel(p.s); });
+    let rt; window.addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { drawHeat(); drawStrip(); }, 100); });
+    const retheme = () => { readColors(); buildImage(); ageLegend(); render(); };
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', retheme);
+    new MutationObserver(retheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  }
+
+  (window.VIZ_DATA ? Promise.resolve(window.VIZ_DATA) : fetch('viz_data.json').then(r => r.json())).then(d => {
+    D = d;
+    let lo = Infinity, hi = -Infinity;
+    for (const f of d.frames) { if (f.b.length) lo = Math.min(lo, f.b[0][0]); if (f.a.length) hi = Math.max(hi, f.a[0][0]); }
+    rows = { lo: lo - 40, hi: hi + 40 };
+    $('k-rec').textContent = d.n_records.toLocaleString('en-US');
+    $('k-msg').textContent = d.n_msgs.toLocaleString('en-US');
+    $('k-snap').textContent = d.n_snapshot.toLocaleString('en-US');
+    $('k-tr').textContent = d.trades.length.toLocaleString('en-US');
+    $('slider').max = d.nsec - 1;
+    readColors(); buildImage(); ageLegend(); bind(); render();
+  }).catch(err => { $('ladder').innerHTML = '<span class="loading">数据载入失败：' + err.message + '</span>'; });
+})();
+</script>
